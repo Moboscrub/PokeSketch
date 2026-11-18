@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Squint &amp; Sketch</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%E2%9C%8F%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- HOME -->
+  <section id="home" class="screen">
+    <div class="home-card">
+      <h1 class="logo"><span>Squint</span><em>&amp;</em><span>Sketch</span></h1>
+      <p class="tagline">Everyone gets the same blurry Pokémon card. Draw what you see, guess who it is, vote for the best drawing.</p>
+      <label class="field">
+        <span>Your name</span>
+        <input id="nameInput" maxlength="16" placeholder="Trainer name" autocomplete="off">
+      </label>
+      <button id="createBtn" class="btn big primary">Create a room</button>
+      <div class="or"><span>or join one</span></div>
+      <div class="join-row">
+        <input id="codeInput" maxlength="4" placeholder="CODE" autocomplete="off" spellcheck="false">
+        <button id="joinBtn" class="btn big">Join</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOBBY -->
+  <section id="lobby" class="screen hidden">
+    <div class="topbar">
+      <div class="logo small"><span>Squint</span><em>&amp;</em><span>Sketch</span></div>
+      <button class="btn ghost leaveBtn">Leave</button>
+    </div>
+    <div class="lobby-grid">
+      <div class="panel">
+        <div class="room-code-label">Room code</div>
+        <div id="roomCode" class="room-code">----</div>
+        <button id="copyLinkBtn" class="btn">Copy invite link</button>
+        <h3 class="panel-title">Players <span id="playerCount"></span></h3>
+        <ul id="lobbyPlayers" class="player-list"></ul>
+      </div>
+      <div class="panel settings">
+        <h3 class="panel-title">Game settings <span id="hostNote" class="muted"></span></h3>
+
+        <div class="setting">
+          <div class="setting-head">
+            <span>Generations</span>
+            <span class="mini-btns"><button class="link host-only" id="gensAll">All</button><button class="link host-only" id="gensKanto">Gen 1 only</button></span>
+          </div>
+          <div id="gens" class="gen-grid"></div>
+        </div>
+
+        <div class="setting">
+          <div class="setting-head"><span>Rounds</span></div>
+          <div class="chips" data-setting="rounds" data-values="3,5,8,10"></div>
+        </div>
+
+        <div class="setting">
+          <div class="setting-head"><span>Drawing time</span></div>
+          <div class="chips" data-setting="drawTime" data-values="45,60,90,120,180" data-suffix="s"></div>
+        </div>
+
+        <div class="setting">
+          <div class="setting-head"><span>Blur</span></div>
+          <div class="chips" data-setting="blur" data-values="light,medium,heavy,brutal"></div>
+        </div>
+
+        <div class="setting">
+          <label class="toggle">
+            <input type="checkbox" id="traceToggle">
+            <span class="toggle-ui"></span>
+            <span><b>Trace mode</b><br><small class="muted">Draw right on top of the blurry card</small></span>
+          </label>
+        </div>
+
+        <button id="startBtn" class="btn big primary host-only">Start game</button>
+        <p id="waitHost" class="muted center guest-only">Waiting for the host to start…</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- GAME -->
+  <section id="game" class="screen hidden">
+    <div class="topbar">
+      <div class="round-pill" id="roundPill">Round 1/5</div>
+      <div class="timer" id="timer"></div>
+      <div class="topbar-right">
+        <button class="btn ghost host-only" id="skipBtn" title="End this phase now">Skip ▸</button>
+        <button class="btn ghost" id="scoresBtn">Scores</button>
+        <button class="btn ghost leaveBtn">Leave</button>
+      </div>
+    </div>
+
+    <div class="game-body">
+      <main class="game-main">
+
+        <div id="v-loading" class="view hidden">
+          <div class="loader"><div class="ball"></div><p>Shuffling the deck…</p></div>
+        </div>
+
+        <div id="v-error" class="view hidden">
+          <div class="panel center">
+            <h2>Card trouble</h2>
+            <p id="errorText"></p>
+            <button class="btn primary host-only" id="retryBtn">Try again</button>
+            <button class="btn host-only" id="errLobbyBtn">Back to lobby</button>
+            <p class="muted guest-only">Waiting for the host…</p>
+          </div>
+        </div>
+
+        <div id="v-draw" class="view hidden">
+          <div class="draw-layout">
+            <div class="card-ref" id="cardRef"><canvas id="refCanvas"></canvas><div class="card-caption">Squint harder.</div></div>
+            <div class="stage-wrap">
+              <div class="stage" id="stage">
+                <canvas id="bgCanvas"></canvas>
+                <canvas id="drawCanvas"></canvas>
+                <div class="locked hidden" id="lockedOverlay"><div>🔒 Locked in!<br><small>Waiting for everyone else…</small></div></div>
+              </div>
+              <div class="tools" id="tools">
+                <div class="swatches" id="swatches"></div>
+                <div class="tool-row">
+                  <button class="tool active" data-tool="brush" title="Brush (B)">✏️</button>
+                  <button class="tool" data-tool="fill" title="Fill (F)">🪣</button>
+                  <button class="tool" data-tool="eraser" title="Eraser (E)">🧽</button>
+                  <span class="sep"></span>
+                  <button class="size active" data-size="5"><i style="width:6px;height:6px"></i></button>
+                  <button class="size" data-size="12"><i style="width:11px;height:11px"></i></button>
+                  <button class="size" data-size="28"><i style="width:18px;height:18px"></i></button>
+                  <span class="sep"></span>
+                  <button class="tool" id="undoBtn" title="Undo (Ctrl+Z)">↶</button>
+                  <button class="tool" id="clearBtn" title="Clear">🗑️</button>
+                </div>
+              </div>
+            </div>
+            <div class="guess-box">
+              <label class="field">
+                <span>Who's that Pokémon?</span>
+                <input id="guessInput" list="pokeNames" maxlength="40" placeholder="Your guess" autocomplete="off">
+                <datalist id="pokeNames"></datalist>
+              </label>
+              <button id="doneBtn" class="btn big primary">Lock it in</button>
+              <p class="muted small-print">+1 for naming it right · +1 for the most votes</p>
+            </div>
+          </div>
+        </div>
+
+        <div id="v-vote" class="view hidden">
+          <h2 class="view-title">Vote for the best drawing</h2>
+          <p class="muted center" id="voteSub"></p>
+          <div class="gallery" id="voteGallery"></div>
+        </div>
+
+        <div id="v-results" class="view hidden">
+          <div class="reveal">
+            <img id="revealImg" alt="The real card">
+            <div class="reveal-text">
+              <div class="muted">It was…</div>
+              <h2 id="revealName"></h2>
+              <div class="muted" id="revealCard"></div>
+              <div class="host-only"><button class="btn big primary" id="nextBtn">Next round</button></div>
+              <p class="muted guest-only">Waiting for the host…</p>
+            </div>
+          </div>
+          <div class="gallery results" id="resultsGallery"></div>
+        </div>
+
+        <div id="v-final" class="view hidden">
+          <h2 class="view-title">Final scores</h2>
+          <div class="podium" id="podium"></div>
+          <ol class="final-list" id="finalList"></ol>
+          <div class="center host-only">
+            <button class="btn big primary" id="againBtn">Play again</button>
+            <button class="btn big" id="toLobbyBtn">Back to lobby</button>
+          </div>
+          <p class="muted center guest-only">Waiting for the host…</p>
+        </div>
+
+      </main>
+      <aside class="sidebar" id="sidebar">
+        <h3 class="panel-title">Scores</h3>
+        <ul id="scoreList" class="player-list compact"></ul>
+      </aside>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
