@@ -317,6 +317,7 @@
       return;
     }
     snapshot();
+    pad.version = (pad.version || 0) + 1;
     if (pad.tool === 'fill') { floodFill(Math.floor(p.x), Math.floor(p.y), pad.color); pad.dirty = true; return; }
     pad.drawing = true; pad.last = p; pad.dirty = true;
     strokeTo({ x: p.x + 0.01, y: p.y + 0.01 }); // a dot on tap
@@ -514,6 +515,15 @@
     }
   }
 
+  function setRef(img, src) {
+    if (!src) { img.classList.add('hidden'); img.removeAttribute('src'); return; }
+    if (img.getAttribute('src') !== src) {
+      img.onerror = () => img.classList.add('hidden');
+      img.src = src;
+    }
+    img.classList.remove('hidden');
+  }
+
   function setupSketch() {
     const sk = state.sk;
     const drawer = state.players.find(p => p.id === sk.drawerId);
@@ -541,11 +551,10 @@
       renderHint(got && sk.word ? sk.word : (sk.hint || ''));
       $('#wpSub').textContent = got ? 'You got it! 🎉' : (sk.hint ? `${(sk.hint.match(/[\p{L}\p{N}_]/gu) || []).length} letters` : '');
     }
-    const img = $('#wpCard');
-    if (state.card && state.card.image && (mine || state.phase === 'turnEnd')) {
-      if (img.getAttribute('src') !== state.card.image) img.src = state.card.image;
-      img.classList.remove('hidden');
-    } else { img.classList.add('hidden'); img.removeAttribute('src'); }
+    // Reference pictures: official artwork right away, plus the real card once it loads.
+    const showRef = state.card && (mine || state.phase === 'turnEnd');
+    setRef($('#wpArt'), showRef ? state.card.art : null);
+    setRef($('#wpCard'), showRef ? state.card.image : null);
 
     const input = $('#chatInput');
     const canGuess = state.phase === 'sketch' && !mine && !got;
@@ -673,6 +682,27 @@
     x.drawImage(pad.canvas, 0, 0, c.width, c.height);
     return c.toDataURL('image/png');
   }
+  // Autosave: every few seconds, quietly send the current drawing + guess so nothing
+  // is lost if this player never taps Lock it in (phone locks, app switch, slow upload).
+  let draftSaved = '';
+  let drafting = false;
+  async function saveDraft() {
+    if (!state || !session || isSketch() || state.phase !== 'drawing' || submittedRound === state.round || submitting || drafting) return;
+    const guess = $('#guessInput').value.trim();
+    const key = state.round + ':' + (pad.version || 0) + ':' + guess;
+    if (key === draftSaved || (!pad.dirty && !guess)) return;
+    drafting = true;
+    try {
+      await api('/api/action', { ...session, type: 'draft', round: state.round, guess, blank: !pad.dirty, drawing: pad.dirty ? exportDrawing() : null });
+      draftSaved = key;
+    } catch (_) { /* try again next tick */ }
+    finally { drafting = false; }
+  }
+  setInterval(saveDraft, 4000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveDraft(); });
+  $('#undoBtn').addEventListener('click', () => { pad.version = (pad.version || 0) + 1; });
+  $('#clearBtn').addEventListener('click', () => { pad.version = (pad.version || 0) + 1; });
+
   async function submitDrawing() {
     if (!state || state.phase !== 'drawing' || submittedRound === state.round || submitting) return;
     submitting = true;
