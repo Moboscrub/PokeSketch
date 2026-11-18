@@ -1,4 +1,4 @@
-// Squint & Sketch — blurred Pokémon card drawing party game
+// PokeSketch — Pokémon drawing party game (Blurry Card mode + Sketch & Guess mode)
 // Zero dependencies. Requires Node 18+ (uses built-in fetch).
 // Run:  node server.js        (then open http://localhost:3000)
 // Env:  PORT=3000  POKEMONTCG_API_KEY=xxxx (optional, raises rate limits)  MOCK=1 (offline test cards)
@@ -39,6 +39,11 @@ function setSpecies(list) {
   list.forEach((slug, i) => { species[i + 1] = { slug, display: prettySpecies(slug) }; });
 }
 async function loadSpecies() {
+  if (MOCK) {
+    const fake = ['pikachu', 'scyther', 'mr-mime', 'psyduck', 'gengar', 'eevee', 'bulbasaur', 'charmander', 'squirtle', 'snorlax', 'ho-oh', 'nidoran-f'];
+    setSpecies(Array.from({ length: 1025 }, (_, i) => fake[i % fake.length]));
+    return;
+  }
   try {
     const cached = JSON.parse(fs.readFileSync(SPECIES_CACHE, 'utf8'));
     if (Array.isArray(cached) && cached.length > 900) { setSpecies(cached); return; }
@@ -189,8 +194,8 @@ const COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4', '#3b82f6'
 function createRoom() {
   const room = {
     code: newCode(), hostId: null, players: new Map(), subs: new Map(),
-    settings: { gens: [1, 2, 3, 4, 5, 6, 7, 8, 9], rounds: 5, drawTime: 90, voteTime: 40, blur: 'medium', trace: true },
-    phase: 'lobby', round: 0, card: null, answers: [], endsAt: 0, timer: null,
+    settings: { mode: 'blur', gens: [1, 2, 3, 4, 5, 6, 7, 8, 9], rounds: 5, drawTime: 90, voteTime: 40, blur: 'medium' },
+    phase: 'lobby', round: 0, card: null, answers: [], endsAt: 0, timer: null, hintTimers: [], sk: null,
     submissions: new Map(), votes: new Map(), keys: new Map(), results: null,
     usedDex: new Set(), error: null, lastActive: Date.now(), loadingToken: 0,
   };
@@ -235,10 +240,11 @@ function publicState(room, pid) {
     const mine = room.submissions.get(pid);
     s.myGuess = mine ? mine.guess : '';
   }
-  if ((room.phase === 'results' || room.phase === 'final') && room.card) {
+  if ((room.phase === 'results' || room.phase === 'final') && room.card && room.settings.mode === 'blur') {
     s.card = { image: room.card.image, name: room.card.display, cardName: room.card.name, set: room.card.set };
     s.results = room.results;
   }
+  if (room.sk && ['choosing', 'sketch', 'turnEnd', 'final', 'error'].includes(room.phase)) Object.assign(s, sketchState(room, pid));
   return s;
 }
 function send(res, obj) { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) { } }
@@ -249,7 +255,11 @@ function broadcast(room) {
     for (const res of set) send(res, st);
   }
 }
-function clearTimer(room) { if (room.timer) { clearTimeout(room.timer); room.timer = null; } }
+function clearTimer(room) {
+  if (room.timer) { clearTimeout(room.timer); room.timer = null; }
+  for (const t of room.hintTimers || []) clearTimeout(t);
+  room.hintTimers = [];
+}
 
 async function startRound(room) {
   clearTimer(room);
@@ -335,6 +345,251 @@ function finishRound(room) {
   broadcast(room);
 }
 
+
+// ---------------------------------------------------------------- Sketch & Guess mode
+// One player draws a Pokémon they picked from 3 random choices; everyone else
+// watches the strokes live and races to type the name.
+const CHOOSE_SECONDS = 15;
+const TURN_END_SECONDS = 7;
+
+function startSketchGame(room) {
+  clearTimer(room);
+  room.card = null; room.results = null; room.error = null;
+  room.sk = {
+    order: [], turnIdx: -1, turnNo: 0, drawerId: null, choices: [], word: null,
+    revealed: new Set(), guessed: new Map(), chat: [], ops: [], result: null,
+  };
+  nextTurn(room);
+}
+function skChat(room, msg) {
+  room.sk.chat.push({ id: rid(4), at: Date.now(), ...msg });
+  if (room.sk.chat.length > 40) room.sk.chat.shift();
+}
+function nextTurn(room) {
+  clearTimer(room);
+  const sk = room.sk;
+  if (!sk) return;
+  for (;;) {
+    sk.turnIdx += 1;
+    if (sk.turnIdx >= sk.order.length) {
+      room.round += 1;
+      if (room.round > room.settings.rounds) { room.phase = 'final'; room.endsAt = 0; sk.drawerId = null; broadcast(room); return; }
+      sk.order = connectedPlayers(room).map(pl => pl.id);
+      sk.turnIdx = 0;
+      if (!sk.order.length) { room.phase = 'final'; room.endsAt = 0; broadcast(room); return; }
+    }
+    const pl = room.players.get(sk.order[sk.turnIdx]);
+    if (pl && pl.connected) { sk.drawerId = pl.id; break; }
+  }
+  prepareChoosing(room);
+}
+async function prepareChoosing(room) {
+  const sk = room.sk;
+  clearTimer(room);
+  if (!species.filter(Boolean).length) await loadSpecies();
+  const pool = [];
+  for (const g of room.settings.gens) {
+    const [a, b] = GENS[g];
+    for (let n = a; n <= b; n++) if (species[n] && !room.usedDex.has(n)) pool.push(n);
+  }
+  if (pool.length < 3) {
+    room.usedDex.clear();
+    for (const g of room.settings.gens) { const [a, b] = GENS[g]; for (let n = a; n <= b; n++) if (species[n]) pool.push(n); }
+  }
+  if (pool.length < 3) {
+    room.phase = 'error';
+    room.error = "Couldn't load the Pokémon name list (PokeAPI may be down). Try again in a moment.";
+    broadcast(room); return;
+  }
+  const picks = [], seen = new Set();
+  while (picks.length < 3 && seen.size < pool.length) {
+    const n = pool[Math.floor(Math.random() * pool.length)];
+    if (seen.has(n)) continue; seen.add(n);
+    if (picks.some(x => species[x].display === species[n].display)) continue;
+    picks.push(n);
+  }
+  sk.turnNo += 1;
+  sk.choices = picks.map(n => ({ dex: n, name: species[n].display }));
+  sk.word = null; sk.revealed = new Set(); sk.guessed = new Map(); sk.ops = []; sk.result = null;
+  room.card = null; room.error = null;
+  room.phase = 'choosing';
+  room.endsAt = Date.now() + CHOOSE_SECONDS * 1000;
+  room.timer = setTimeout(() => { if (room.phase === 'choosing') chooseWord(room, 0); }, CHOOSE_SECONDS * 1000 + 500);
+  broadcast(room);
+}
+function chooseWord(room, i) {
+  const sk = room.sk;
+  clearTimer(room);
+  const c = sk.choices[i];
+  room.usedDex.add(c.dex);
+  const display = c.name;
+  sk.word = { dex: c.dex, display, answers: buildAnswers({ name: display, dexNums: [c.dex] }) };
+  sk.ops = [];
+  room.phase = 'sketch';
+  const total = room.settings.drawTime * 1000;
+  sk.startedAt = Date.now();
+  room.endsAt = sk.startedAt + total;
+  room.timer = setTimeout(() => endTurn(room), total + 300);
+  // Reveal letters as hints when time runs low.
+  const letters = [...display].map((ch, idx) => /[\p{L}\p{N}]/u.test(ch) ? idx : -1).filter(x => x >= 0);
+  const hints = letters.length >= 5 ? [0.5, 0.75] : letters.length >= 3 ? [0.6] : [];
+  for (const f of hints) room.hintTimers.push(setTimeout(() => revealHint(room), total * f));
+  const drawer = room.players.get(sk.drawerId);
+  skChat(room, { sys: true, text: `${drawer ? drawer.name : 'Someone'} is drawing!` });
+  broadcast(room);
+  // Fetch a real card for the drawer's reference and the reveal (doesn't block the turn).
+  const turnNo = sk.turnNo;
+  (async () => {
+    try {
+      let card;
+      if (MOCK) card = mockCard(c.dex);
+      else {
+        const cards = await fetchCardsForDex(c.dex);
+        if (!cards.length) return;
+        const x = cards[Math.floor(Math.random() * cards.length)];
+        card = { name: x.name, set: x.set ? x.set.name : '', image: x.images.large || x.images.small };
+      }
+      if (room.sk === sk && sk.turnNo === turnNo) { room.card = card; broadcast(room); }
+    } catch (_) { /* reference card is optional */ }
+  })();
+}
+function revealHint(room) {
+  const sk = room.sk;
+  if (room.phase !== 'sketch' || !sk.word) return;
+  const hidden = [...sk.word.display].map((ch, idx) => /[\p{L}\p{N}]/u.test(ch) && !sk.revealed.has(idx) ? idx : -1).filter(x => x >= 0);
+  if (hidden.length <= 1) return;
+  sk.revealed.add(hidden[Math.floor(Math.random() * hidden.length)]);
+  broadcast(room);
+}
+function hintPattern(sk) {
+  return [...sk.word.display].map((ch, idx) => (/[\p{L}\p{N}]/u.test(ch) && !sk.revealed.has(idx)) ? '_' : ch).join('');
+}
+function maybeAllGuessed(room) {
+  const sk = room.sk;
+  if (room.phase !== 'sketch') return;
+  const guessers = connectedPlayers(room).filter(pl => pl.id !== sk.drawerId);
+  if (guessers.length && guessers.every(pl => sk.guessed.has(pl.id))) endTurn(room);
+}
+function sketchGuess(room, p, body) {
+  const sk = room.sk;
+  const text = String(body.text || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60);
+  if (!text) return null;
+  if (!sk || room.phase !== 'sketch') {
+    if (sk && ['choosing', 'turnEnd'].includes(room.phase)) { skChat(room, { pid: p.id, name: p.name, color: p.color, text }); broadcast(room); }
+    return null;
+  }
+  if (sk.drawerId === p.id) return "You're drawing! No hints in chat.";
+  if (sk.guessed.has(p.id)) return 'You already got it!';
+  if (isCorrect(text, sk.word.answers)) {
+    const left = Math.max(0, room.endsAt - Date.now()) / (room.settings.drawTime * 1000);
+    const pts = Math.max(20, Math.round((20 + 80 * left) / 5) * 5);
+    sk.guessed.set(p.id, pts);
+    p.score += pts;
+    skChat(room, { sys: true, ok: true, text: `${p.name} guessed it! (+${pts})` });
+    broadcast(room);
+    maybeAllGuessed(room);
+    return { correct: true, points: pts };
+  }
+  const g = norm(text);
+  const close = g.length >= 3 && sk.word.answers.some(a => a.length >= 4 && lev(a, g) <= 2);
+  skChat(room, { pid: p.id, name: p.name, color: p.color, text });
+  broadcast(room);
+  return close ? { close: true } : null;
+}
+const OP_COLOR = /^#[0-9a-f]{6}$/i;
+const num = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n * 10) / 10)) : null; };
+function cleanOp(o) {
+  if (!o || typeof o !== 'object') return null;
+  switch (o.k) {
+    case 'b': { // begin stroke
+      const x = num(o.x, -50, 750), y = num(o.y, -50, 1030), w = num(o.w, 1, 120);
+      if (x === null || y === null || w === null || (!o.e && !OP_COLOR.test(o.c))) return null;
+      return { k: 'b', x, y, w, e: !!o.e, c: o.e ? '#000000' : o.c };
+    }
+    case 'm': { // more points for the current stroke
+      if (!Array.isArray(o.p) || o.p.length > 600 || o.p.length % 2) return null;
+      const pts = o.p.map((v, i) => num(v, -50, i % 2 ? 1030 : 750));
+      return pts.includes(null) ? null : { k: 'm', p: pts };
+    }
+    case 'f': { // bucket fill
+      const x = num(o.x, 0, 699), y = num(o.y, 0, 979);
+      if (x === null || y === null || !OP_COLOR.test(o.c)) return null;
+      return { k: 'f', x: Math.floor(x), y: Math.floor(y), c: o.c };
+    }
+    case 'u': return { k: 'u' };
+    case 'x': return { k: 'x' };
+    default: return null;
+  }
+}
+function sketchDraw(room, p, body) {
+  const sk = room.sk;
+  if (!sk || room.phase !== 'sketch' || sk.drawerId !== p.id) return 'Not your turn to draw.';
+  if (Number(body.turnNo) !== sk.turnNo) return 'Old turn.';
+  if (!Array.isArray(body.ops) || body.ops.length > 500) return 'Bad drawing data.';
+  if (sk.ops.length > 30000) return 'Drawing is too big.';
+  const from = sk.ops.length;
+  const ops = body.ops.map(cleanOp).filter(Boolean);
+  if (!ops.length) return null;
+  sk.ops.push(...ops);
+  const payload = `event: ops\ndata: ${JSON.stringify({ turnNo: sk.turnNo, from, ops })}\n\n`;
+  for (const [pid, set] of room.subs) {
+    if (pid === p.id) continue;
+    for (const res of set) { try { res.write(payload); } catch (_) { } }
+  }
+  room.lastActive = Date.now();
+  return null;
+}
+function endTurn(room) {
+  const sk = room.sk;
+  if (!sk || !['choosing', 'sketch'].includes(room.phase)) return;
+  clearTimer(room);
+  const drawer = room.players.get(sk.drawerId);
+  const drawerGain = sk.word ? sk.guessed.size * 25 : 0;
+  if (drawer) drawer.score += drawerGain;
+  if (!sk.word && sk.choices.length) {
+    // Drawer never picked (left or skipped): show what it would have been.
+    const c = sk.choices[0]; sk.word = { dex: c.dex, display: c.name, answers: [] };
+  }
+  const rows = [];
+  for (const pl of room.players.values()) {
+    if (pl.id === sk.drawerId) continue;
+    rows.push({ name: pl.name, color: pl.color, points: sk.guessed.get(pl.id) || 0, guessed: sk.guessed.has(pl.id) });
+  }
+  rows.sort((a, b) => b.points - a.points);
+  sk.result = {
+    word: sk.word ? sk.word.display : '?', drawerName: drawer ? drawer.name : 'Someone',
+    drawerColor: drawer ? drawer.color : '#999', drawerGain, rows,
+    isLast: room.round >= room.settings.rounds && sk.turnIdx >= sk.order.length - 1,
+  };
+  skChat(room, { sys: true, text: `It was ${sk.result.word}!` });
+  room.phase = 'turnEnd';
+  room.endsAt = Date.now() + TURN_END_SECONDS * 1000;
+  room.timer = setTimeout(() => nextTurn(room), TURN_END_SECONDS * 1000);
+  broadcast(room);
+}
+function sketchState(room, pid) {
+  const sk = room.sk;
+  const isDrawer = sk.drawerId === pid;
+  const out = {
+    mode: 'sketch',
+    sk: {
+      turnNo: sk.turnNo, drawerId: sk.drawerId, turn: sk.turnIdx + 1, turns: sk.order.length,
+      chat: sk.chat, guessed: [...sk.guessed.keys()], opsLen: sk.ops.length,
+    },
+  };
+  if (room.phase === 'choosing' && isDrawer) out.sk.choices = sk.choices.map(c => c.name);
+  if (room.phase === 'sketch' && sk.word) {
+    out.sk.hint = hintPattern(sk);
+    if (isDrawer || sk.guessed.has(pid)) out.sk.word = sk.word.display;
+    if (isDrawer && room.card) out.card = { image: room.card.image };
+  }
+  if (room.phase === 'turnEnd') {
+    out.sk.result = sk.result;
+    if (room.card) out.card = { image: room.card.image, cardName: room.card.name, set: room.card.set };
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- http helpers
 function json(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -369,10 +624,10 @@ function handleAction(room, p, body) {
         const g = [...new Set(s.gens.map(Number).filter(n => GENS[n]))].sort((a, b) => a - b);
         if (g.length) st.gens = g;
       }
-      if ([3, 5, 8, 10].includes(Number(s.rounds))) st.rounds = Number(s.rounds);
+      if (['blur', 'sketch'].includes(s.mode)) st.mode = s.mode;
+      if ([1, 2, 3, 5, 8, 10].includes(Number(s.rounds))) st.rounds = Number(s.rounds);
       if ([45, 60, 90, 120, 180].includes(Number(s.drawTime))) st.drawTime = Number(s.drawTime);
       if (['light', 'medium', 'heavy', 'brutal'].includes(s.blur)) st.blur = s.blur;
-      if (typeof s.trace === 'boolean') st.trace = s.trace;
       room.usedDex.clear();
       broadcast(room); return null;
     }
@@ -381,10 +636,13 @@ function handleAction(room, p, body) {
       if (!['lobby', 'final'].includes(room.phase)) return 'Game already running.';
       for (const pl of room.players.values()) pl.score = 0;
       room.round = 0; room.gameId = (room.gameId || 0) + 1;
-      startRound(room); return null;
+      if (room.settings.mode === 'sketch') startSketchGame(room);
+      else { room.sk = null; startRound(room); }
+      return null;
     }
     case 'next': {
       if (!isHost) return 'Only the host can continue.';
+      if (room.phase === 'error' && room.sk) { prepareChoosing(room); return null; }
       if (room.phase === 'results' || room.phase === 'error') { startRound(room); return null; }
       return 'Not now.';
     }
@@ -392,7 +650,7 @@ function handleAction(room, p, body) {
       if (!isHost) return 'Only the host can do that.';
       clearTimer(room); room.loadingToken++;
       room.phase = 'lobby'; room.round = 0; room.card = null; room.results = null; room.error = null; room.endsAt = 0;
-      room.submissions = new Map(); room.votes = new Map(); room.keys = new Map();
+      room.submissions = new Map(); room.votes = new Map(); room.keys = new Map(); room.sk = null;
       for (const pl of room.players.values()) pl.score = 0;
       broadcast(room); return null;
     }
@@ -400,8 +658,18 @@ function handleAction(room, p, body) {
       if (!isHost) return 'Only the host can do that.';
       if (room.phase === 'drawing') endDrawing(room);
       else if (room.phase === 'voting') finishRound(room);
+      else if (room.phase === 'choosing' || room.phase === 'sketch') endTurn(room);
+      else if (room.phase === 'turnEnd') nextTurn(room);
       return null;
     }
+    case 'choose': {
+      const sk = room.sk;
+      if (!sk || room.phase !== 'choosing' || sk.drawerId !== p.id) return 'Not your turn to pick.';
+      const i = Number(body.index);
+      if (!(i >= 0 && i < sk.choices.length)) return 'Pick one of the three.';
+      chooseWord(room, i); return null;
+    }
+    case 'guess': return sketchGuess(room, p, body);
     case 'submit': {
       if (room.phase !== 'drawing' || Number(body.round) !== room.round) return 'Drawing time is over.';
       const guess = String(body.guess || '').slice(0, 40);
@@ -439,6 +707,10 @@ function handleAction(room, p, body) {
       room.players.delete(p.id);
       if (room.hostId === p.id) { const next = connectedPlayers(room)[0] || [...room.players.values()][0]; room.hostId = next ? next.id : null; }
       if (!room.players.size) { clearTimer(room); rooms.delete(room.code); return null; }
+      if (room.sk && ['choosing', 'sketch'].includes(room.phase)) {
+        if (room.sk.drawerId === p.id) { endTurn(room); return null; }
+        maybeAllGuessed(room);
+      }
       broadcast(room); return null;
     }
     default: return 'Unknown action.';
@@ -461,6 +733,9 @@ function onDisconnect(room, p) {
       if (everyone.length && everyone.every(pl => room.submissions.has(pl.id))) endDrawing(room);
     }
     if (room.phase === 'voting') maybeEndVoting(room);
+    if (room.sk && ['choosing', 'sketch'].includes(room.phase)) {
+      if (room.sk.drawerId === p.id) endTurn(room); else maybeAllGuessed(room);
+    }
     broadcast(room);
   }, 15000);
 }
@@ -510,8 +785,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const { room, p: pl } = auth(body);
       if (!pl) return json(res, 403, { error: 'Not in this room.' });
-      const err = handleAction(room, pl, body);
+      const out = handleAction(room, pl, body);
+      if (typeof out === 'string') return json(res, 400, { error: out });
+      return json(res, 200, { ok: true, ...(out || {}) });
+    }
+    if (req.method === 'POST' && p === '/api/draw') {
+      const body = await readBody(req, 512 * 1024);
+      const { room, p: pl } = auth(body);
+      if (!pl) return json(res, 403, { error: 'Not in this room.' });
+      const err = sketchDraw(room, pl, body);
       return json(res, err ? 400 : 200, err ? { error: err } : { ok: true });
+    }
+    if (req.method === 'GET' && p === '/api/ops') {
+      const { room, p: pl } = auth(Object.fromEntries(url.searchParams));
+      if (!pl || !room.sk) return json(res, 403, { error: 'Not in this room.' });
+      return json(res, 200, { turnNo: room.sk.turnNo, seq: room.sk.ops.length, ops: room.sk.ops });
     }
     let m;
     if (req.method === 'GET' && (m = p.match(/^\/api\/drawing\/([A-Z]{4})\/([\w-]+)$/))) {
