@@ -1,4 +1,4 @@
-/* Squint & Sketch — client */
+/* PokeSketch — client */
 (() => {
   const $ = s => document.querySelector(s);
   const $$ = s => [...document.querySelectorAll(s)];
@@ -42,7 +42,7 @@
   }
   async function act(type, extra = {}) {
     if (!session) return;
-    try { await api('/api/action', { ...session, type, ...extra }); }
+    try { return await api('/api/action', { ...session, type, ...extra }); }
     catch (e) { toast(e.message); throw e; }
   }
 
@@ -83,6 +83,7 @@
       state = data;
       render();
     };
+    es.addEventListener('ops', ev => { try { onOps(JSON.parse(ev.data)); } catch (_) { } });
     const mine = es;
     es.onerror = () => {
       // The browser also closes the stream while the page unloads; don't forget the session then.
@@ -150,6 +151,7 @@
         let s = '';
         if (state.phase === 'drawing') s = p.submitted ? '✅' : '✏️';
         if (state.phase === 'voting') s = p.voted ? '✅' : '🤔';
+        if (state.sk && ['choosing', 'sketch'].includes(state.phase)) s = p.id === state.sk.drawerId ? '✏️' : (state.sk.guessed.includes(p.id) ? '✅' : '');
         if (s) li.appendChild(el('span', 'status', s));
       }
       if (opts.byScore) li.appendChild(el('span', 'score', p.score));
@@ -194,10 +196,15 @@
         box.appendChild(c);
       }
     });
-    const t = $('#traceToggle'); t.checked = !!s.trace; t.disabled = !host;
+    $$('.mode').forEach(b => {
+      b.classList.toggle('on', b.dataset.mode === s.mode);
+      b.disabled = !host;
+    });
+    $('#blurSetting').classList.toggle('hidden', s.mode === 'sketch');
+    $('#roundsNote').textContent = s.mode === 'sketch' ? 'everyone draws once per round' : '';
     loadNames(s.gens);
   }
-  $('#traceToggle').onchange = e => act('settings', { settings: { trace: e.target.checked } }).catch(() => { e.target.checked = !e.target.checked; });
+  $$('.mode').forEach(b => b.onclick = () => act('settings', { settings: { mode: b.dataset.mode } }).catch(() => { }));
   $('#gensAll').onclick = () => act('settings', { settings: { gens: [1, 2, 3, 4, 5, 6, 7, 8, 9] } }).catch(() => { });
   $('#gensKanto').onclick = () => act('settings', { settings: { gens: [1] } }).catch(() => { });
   $('#startBtn').onclick = () => act('start').catch(() => { });
@@ -252,16 +259,16 @@
   // ------------------------------------------------------------ drawing pad
   const pad = {
     canvas: $('#drawCanvas'), ctx: null, tool: 'brush', color: '#111111', size: 5,
-    history: [], drawing: false, last: null, dirty: false, transparent: false,
+    history: [], drawing: false, last: null, dirty: false,
   };
   pad.ctx = pad.canvas.getContext('2d', { willReadFrequently: true });
 
-  function resetPad(trace) {
-    pad.transparent = trace;
-    pad.canvas.width = trace ? 700 : 800;
-    pad.canvas.height = trace ? 980 : 800;
+  // The drawing layer is always transparent, so the blurred card can show through it
+  // when Trace is on. The white background is added when the drawing is exported.
+  function resetPad() {
+    pad.canvas.width = 700;
+    pad.canvas.height = 980;
     pad.ctx.clearRect(0, 0, pad.canvas.width, pad.canvas.height);
-    if (!trace) { pad.ctx.fillStyle = '#fff'; pad.ctx.fillRect(0, 0, pad.canvas.width, pad.canvas.height); }
     pad.history = []; pad.dirty = false; pad.drawing = false;
   }
   function snapshot() {
@@ -281,8 +288,7 @@
     const c = pad.ctx;
     c.save();
     if (pad.tool === 'eraser') {
-      if (pad.transparent) { c.globalCompositeOperation = 'destination-out'; c.strokeStyle = '#000'; }
-      else c.strokeStyle = '#fff';
+      c.globalCompositeOperation = 'destination-out'; c.strokeStyle = '#000';
     } else c.strokeStyle = pad.color;
     c.lineWidth = pad.size * scale() * (pad.tool === 'eraser' ? 1.8 : 1);
     c.lineCap = 'round'; c.lineJoin = 'round';
@@ -290,13 +296,26 @@
     c.restore();
     pad.last = p;
   }
-  const locked = () => !state || state.phase !== 'drawing' || submittedRound === state.round;
+  const isSketch = () => !!(state && state.sk && state.settings.mode === 'sketch');
+  const amDrawer = () => isSketch() && state.phase === 'sketch' && state.sk.drawerId === state.you;
+  const locked = () => {
+    if (!state) return true;
+    if (isSketch()) return !amDrawer();
+    return state.phase !== 'drawing' || submittedRound === state.round;
+  };
 
   pad.canvas.addEventListener('pointerdown', e => {
     if (locked()) return;
     e.preventDefault();
     pad.canvas.setPointerCapture(e.pointerId);
     const p = posOf(e);
+    if (isSketch()) {
+      if (pad.tool === 'fill') { sendOp({ k: 'f', x: Math.floor(p.x), y: Math.floor(p.y), c: pad.color }); return; }
+      pad.drawing = true;
+      const er = pad.tool === 'eraser';
+      sendOp({ k: 'b', x: r1(p.x), y: r1(p.y), w: r1(pad.size * scale() * (er ? 1.8 : 1)), e: er, c: pad.color });
+      return;
+    }
     snapshot();
     if (pad.tool === 'fill') { floodFill(Math.floor(p.x), Math.floor(p.y), pad.color); pad.dirty = true; return; }
     pad.drawing = true; pad.last = p; pad.dirty = true;
@@ -305,6 +324,12 @@
   pad.canvas.addEventListener('pointermove', e => {
     if (!pad.drawing) return;
     const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    if (isSketch()) {
+      const pts = [];
+      for (const ev of (evs.length ? evs : [e])) { const q = posOf(ev); pts.push(r1(q.x), r1(q.y)); }
+      sendOp({ k: 'm', p: pts });
+      return;
+    }
     for (const ev of (evs.length ? evs : [e])) strokeTo(posOf(ev));
   });
   const stop = () => { pad.drawing = false; };
@@ -317,6 +342,7 @@
     return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 255];
   }
   function floodFill(x, y, hex) {
+    x = Math.floor(x); y = Math.floor(y);
     const { width: W, height: H } = pad.canvas;
     if (x < 0 || y < 0 || x >= W || y >= H) return;
     const img = pad.ctx.getImageData(0, 0, W, H);
@@ -361,20 +387,229 @@
   function setTool(t) { pad.tool = t; $$('.tool[data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === t)); }
   $$('.tool[data-tool]').forEach(b => b.onclick = () => setTool(b.dataset.tool));
   $$('.size').forEach(b => b.onclick = () => { pad.size = Number(b.dataset.size); $$('.size').forEach(x => x.classList.toggle('active', x === b)); });
-  $('#undoBtn').onclick = () => { if (!locked()) undo(); };
+  let traceOn = false;
+  try { traceOn = localStorage.getItem('ss-trace') === '1'; } catch (_) { }
+  function applyTrace() {
+    $('#stage').classList.toggle('show-trace', traceOn);
+    $('#traceBtn').classList.toggle('active', traceOn);
+  }
+  $('#traceBtn').onclick = () => {
+    traceOn = !traceOn; applyTrace();
+    try { localStorage.setItem('ss-trace', traceOn ? '1' : '0'); } catch (_) { }
+  };
+  applyTrace();
+  $('#undoBtn').onclick = () => { if (locked()) return; if (isSketch()) sendOp({ k: 'u' }); else undo(); };
   $('#clearBtn').onclick = () => {
     if (locked()) return;
+    if (isSketch()) { sendOp({ k: 'x' }); return; }
     snapshot();
     pad.ctx.clearRect(0, 0, pad.canvas.width, pad.canvas.height);
-    if (!pad.transparent) { pad.ctx.fillStyle = '#fff'; pad.ctx.fillRect(0, 0, pad.canvas.width, pad.canvas.height); }
   };
   document.addEventListener('keydown', e => {
-    if (!state || state.phase !== 'drawing' || e.target.tagName === 'INPUT') return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (!locked()) undo(); }
+    if (!state || !['drawing', 'sketch'].includes(state.phase) || e.target.tagName === 'INPUT' || locked()) return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); $('#undoBtn').click(); }
     else if (e.key === 'b') setTool('brush');
     else if (e.key === 'f') setTool('fill');
     else if (e.key === 'e') setTool('eraser');
+    else if (e.key === 't') $('#traceBtn').click();
   });
+
+
+  // ------------------------------------------------------------ Sketch & Guess: live drawing
+  // The drawer's strokes become small "ops" that are drawn locally, sent to the
+  // server in batches, and replayed on everyone else's canvas.
+  const r1 = v => Math.round(v * 10) / 10;
+  const live = { turnNo: null, ops: [], cur: null, outbox: [], sending: false, fetching: false };
+
+  function drawSeg(from, to, cur) {
+    const c = pad.ctx;
+    c.save();
+    if (cur.e) c.globalCompositeOperation = 'destination-out';
+    c.strokeStyle = cur.e ? '#000' : cur.c;
+    c.lineWidth = cur.w; c.lineCap = 'round'; c.lineJoin = 'round';
+    c.beginPath(); c.moveTo(from.x, from.y); c.lineTo(to.x, to.y); c.stroke();
+    c.restore();
+  }
+  function applyOp(op) {
+    if (op.k === 'b') {
+      live.cur = { e: op.e, c: op.c, w: op.w, last: { x: op.x, y: op.y } };
+      drawSeg(live.cur.last, { x: op.x + 0.01, y: op.y + 0.01 }, live.cur);
+    } else if (op.k === 'm' && live.cur) {
+      for (let i = 0; i < op.p.length; i += 2) {
+        const p = { x: op.p[i], y: op.p[i + 1] };
+        drawSeg(live.cur.last, p, live.cur); live.cur.last = p;
+      }
+    } else if (op.k === 'f') { live.cur = null; floodFill(op.x, op.y, op.c); }
+    else if (op.k === 'x') { live.cur = null; pad.ctx.clearRect(0, 0, pad.canvas.width, pad.canvas.height); }
+    else if (op.k === 'u') { replay(live.ops); }
+  }
+  // Redraw from scratch, honouring undo: each stroke / fill / clear is one undo step.
+  function replay(ops) {
+    const groups = [];
+    for (const op of ops) {
+      if (op.k === 'm') { if (groups.length && groups[groups.length - 1][0].k === 'b') groups[groups.length - 1].push(op); }
+      else if (op.k === 'u') groups.pop();
+      else groups.push([op]);
+    }
+    pad.ctx.clearRect(0, 0, pad.canvas.width, pad.canvas.height);
+    live.cur = null;
+    for (const g of groups) for (const op of g) { if (op.k !== 'u') applyOp(op); }
+    live.cur = null;
+  }
+  function sendOp(op) {
+    live.ops.push(op);
+    applyOp(op);
+    const last = live.outbox[live.outbox.length - 1];
+    if (op.k === 'm' && last && last.k === 'm' && last.p.length + op.p.length <= 600) last.p.push(...op.p);
+    else live.outbox.push(op.k === 'm' ? { k: 'm', p: [...op.p] } : op);
+  }
+  async function flushOps() {
+    if (live.sending || !live.outbox.length || !session || !amDrawer()) return;
+    live.sending = true;
+    const ops = live.outbox.splice(0, 400);
+    try {
+      await fetch('/api/draw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...session, turnNo: live.turnNo, ops }) });
+    } catch (_) { live.outbox.unshift(...ops); }
+    finally { live.sending = false; }
+  }
+  setInterval(flushOps, 60);
+
+  async function fetchAllOps() {
+    if (live.fetching || !session) return;
+    live.fetching = true;
+    try {
+      const r = await fetch(`/api/ops?code=${session.code}&pid=${session.pid}&token=${session.token}`);
+      const j = await r.json();
+      if (j.turnNo === live.turnNo) { live.ops = j.ops || []; replay(live.ops); }
+    } catch (_) { }
+    finally { live.fetching = false; }
+  }
+  function onOps(msg) {
+    if (!state || msg.turnNo !== live.turnNo || amDrawer()) return;
+    if (msg.from !== live.ops.length) { fetchAllOps(); return; } // missed something: resync
+    for (const op of msg.ops) { live.ops.push(op); applyOp(op); }
+  }
+
+  let chatKey = '';
+  function renderChat() {
+    const chat = state.sk.chat || [];
+    const key = chat.length ? chat[chat.length - 1].id + ':' + chat.length : '0';
+    if (key === chatKey) return;
+    chatKey = key;
+    const log = $('#chatLog'); log.innerHTML = '';
+    for (const m of chat) {
+      const d = el('div', 'msg' + (m.sys ? ' sys' : '') + (m.ok ? ' ok' : ''));
+      if (m.sys) d.textContent = m.text;
+      else { const b = el('b', null, m.name + ':'); b.style.color = m.color; d.appendChild(b); d.appendChild(document.createTextNode(m.text)); }
+      log.appendChild(d);
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+  function renderHint(text) {
+    const box = $('#wpHint'); box.innerHTML = '';
+    box.style.fontSize = text.length > 11 ? '17px' : text.length > 8 ? '21px' : '26px';
+    for (const ch of text) {
+      if (ch === ' ') box.appendChild(el('span', 'gap'));
+      else box.appendChild(el('span', ch === '_' ? 'ch blank' : 'ch', ch === '_' ? '' : ch));
+    }
+  }
+
+  function setupSketch() {
+    const sk = state.sk;
+    const drawer = state.players.find(p => p.id === sk.drawerId);
+    const dname = drawer ? drawer.name : 'Someone';
+    const mine = sk.drawerId === state.you;
+    if (live.turnNo !== sk.turnNo) {
+      live.turnNo = sk.turnNo; live.ops = []; live.outbox = []; live.cur = null;
+      resetPad(); setTool('brush');
+      $('#chatInput').value = '';
+      if (sk.opsLen > 0) fetchAllOps(); // joined or refreshed mid-turn
+      loadNames(state.settings.gens);
+    }
+    $('.draw-layout').classList.toggle('viewer', !(mine && state.phase === 'sketch'));
+    const got = sk.guessed.includes(state.you);
+    if (state.phase === 'turnEnd') {
+      $('#wpWho').textContent = 'It was';
+      renderHint(sk.result.word);
+      $('#wpSub').textContent = '';
+    } else if (mine) {
+      $('#wpWho').textContent = 'You are drawing';
+      renderHint(sk.word || '');
+      $('#wpSub').textContent = 'Use the card for reference. No letters or words!';
+    } else {
+      $('#wpWho').textContent = `${dname} is drawing`;
+      renderHint(got && sk.word ? sk.word : (sk.hint || ''));
+      $('#wpSub').textContent = got ? 'You got it! 🎉' : (sk.hint ? `${(sk.hint.match(/[\p{L}\p{N}_]/gu) || []).length} letters` : '');
+    }
+    const img = $('#wpCard');
+    if (state.card && state.card.image && (mine || state.phase === 'turnEnd')) {
+      if (img.getAttribute('src') !== state.card.image) img.src = state.card.image;
+      img.classList.remove('hidden');
+    } else { img.classList.add('hidden'); img.removeAttribute('src'); }
+
+    const input = $('#chatInput');
+    const canGuess = state.phase === 'sketch' && !mine && !got;
+    input.disabled = state.phase === 'sketch' && (mine || got);
+    input.placeholder = mine && state.phase === 'sketch' ? "You're drawing. No hints!" : got ? 'You got it! 🎉' : 'Type your guess…';
+    if (!canGuess && document.activeElement === input && input.disabled) input.blur();
+    renderChat();
+
+    const ov = $('#turnOverlay');
+    if (state.phase === 'turnEnd' && sk.result) {
+      const r = sk.result;
+      ov.innerHTML = '';
+      const box = el('div');
+      box.appendChild(el('div', 'muted', 'It was…'));
+      box.appendChild(el('h2', null, r.word));
+      box.appendChild(el('div', null, `${r.drawerName} drew it: +${r.drawerGain}`));
+      const ul = el('ul', 'to-rows');
+      for (const row of r.rows) {
+        const li = el('li', row.guessed ? '' : 'miss');
+        const n = el('span', null, row.name); n.style.color = row.guessed ? row.color : '';
+        li.appendChild(n); li.appendChild(el('span', null, row.guessed ? `+${row.points}` : 'missed'));
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+      box.appendChild(el('div', 'muted', r.isLast ? 'Final scores next…' : 'Next turn starting…'));
+      ov.appendChild(box);
+      ov.classList.remove('hidden');
+    } else ov.classList.add('hidden');
+    $('#lockedOverlay').classList.add('hidden');
+  }
+  $('#chatInput').addEventListener('keydown', async e => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const text = e.target.value.trim();
+    if (!text) return;
+    e.target.value = '';
+    try {
+      const r = await act('guess', { text });
+      if (r && r.correct) toast(`You got it! +${r.points}`, 2000);
+      else if (r && r.close) toast(`“${text}” is so close!`, 2000);
+    } catch (_) { }
+  });
+
+  function renderChoose() {
+    const sk = state.sk;
+    const mine = sk.drawerId === state.you;
+    $('#chooseMine').classList.toggle('hidden', !mine);
+    $('#chooseWait').classList.toggle('hidden', mine);
+    if (mine) {
+      const box = $('#choices');
+      const key = sk.turnNo + ':' + (sk.choices || []).join('|');
+      if (box.dataset.key !== key) {
+        box.dataset.key = key; box.innerHTML = '';
+        (sk.choices || []).forEach((name, i) => {
+          const b = el('button', 'choice', name);
+          b.onclick = () => act('choose', { index: i }).catch(() => { });
+          box.appendChild(b);
+        });
+      }
+    } else {
+      const d = state.players.find(p => p.id === sk.drawerId);
+      $('#chooseWho').textContent = `${d ? d.name : 'Someone'} is picking a Pokémon…`;
+    }
+  }
 
   // ------------------------------------------------------------ game views
   let drawRoundKey = null;     // which round the drawing view was set up for
@@ -385,9 +620,12 @@
   function showView(id) { $$('.view').forEach(v => v.classList.toggle('hidden', v.id !== id)); }
 
   function renderGame() {
-    $('#roundPill').textContent = state.phase === 'final' ? 'Game over' : `Round ${Math.max(1, state.round)}/${state.totalRounds}`;
+    document.body.classList.toggle('mode-sketch', isSketch());
+    let pill = state.phase === 'final' ? 'Game over' : `Round ${Math.max(1, state.round)}/${state.totalRounds}`;
+    if (isSketch() && state.phase !== 'final') pill += ` · Turn ${state.sk.turn}/${state.sk.turns}`;
+    $('#roundPill').textContent = pill;
     renderPlayers($('#scoreList'), { byScore: true, status: true });
-    $('#skipBtn').classList.toggle('hidden', !['drawing', 'voting'].includes(state.phase));
+    $('#skipBtn').classList.toggle('hidden', !['drawing', 'voting', 'choosing', 'sketch', 'turnEnd'].includes(state.phase));
     switch (state.phase) {
       case 'loading': showView('v-loading'); break;
       case 'error': showView('v-error'); $('#errorText').textContent = state.error || ''; break;
@@ -395,21 +633,22 @@
       case 'voting': showView('v-vote'); renderVote(); break;
       case 'results': showView('v-results'); renderResults(); break;
       case 'final': showView('v-final'); renderFinal(); break;
+      case 'choosing': showView('v-choose'); renderChoose(); break;
+      case 'sketch': case 'turnEnd': showView('v-draw'); setupSketch(); break;
     }
     tick();
   }
 
   function setupDraw() {
     const key = state.code + ':' + state.gameId + ':' + state.round + ':' + state.card.image;
-    const trace = !!state.settings.trace;
-    $('.draw-layout').classList.toggle('trace', trace);
-    $('#stage').classList.toggle('trace', trace);
     if (drawRoundKey !== key) {
-      drawRoundKey = key;
-      submitting = false; submittedRound = -1; autoRound = -1;
-      resetPad(trace);
+      drawRoundKey = key; live.turnNo = null;
+      submitting = false; submittedRound = -1; autoRound = -1; disarm();
+      resetPad();
       setTool('brush');
       $('#guessInput').value = '';
+      $('.draw-layout').classList.remove('viewer');
+      $('#turnOverlay').classList.add('hidden');
       blurredInto($('#refCanvas'));
       blurredInto($('#bgCanvas'));
       loadNames(state.settings.gens);
@@ -418,7 +657,8 @@
     const isLocked = submittedRound === state.round;
     $('#lockedOverlay').classList.toggle('hidden', !isLocked);
     $('#doneBtn').disabled = isLocked;
-    $('#doneBtn').textContent = isLocked ? 'Locked in ✓' : 'Lock it in';
+    if (isLocked) $('#doneBtn').textContent = 'Locked in ✓';
+    else if (!armTimer) $('#doneBtn').textContent = 'Lock it in';
     $('#guessInput').disabled = isLocked;
   }
 
@@ -428,6 +668,7 @@
     const c = document.createElement('canvas');
     c.width = Math.round(pad.canvas.width * s); c.height = Math.round(pad.canvas.height * s);
     const x = c.getContext('2d');
+    x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); // plain white background
     x.imageSmoothingQuality = 'high';
     x.drawImage(pad.canvas, 0, 0, c.width, c.height);
     return c.toDataURL('image/png');
@@ -443,12 +684,30 @@
     } catch (_) { /* toast already shown */ }
     finally { submitting = false; }
   }
-  $('#doneBtn').onclick = submitDrawing;
-  $('#guessInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitDrawing(); });
+  // Two taps to lock in, so nobody submits by accident.
+  let armTimer = null;
+  function disarm() {
+    clearTimeout(armTimer); armTimer = null;
+    const b = $('#doneBtn'); b.classList.remove('armed');
+    if (!b.disabled) b.textContent = 'Lock it in';
+  }
+  $('#doneBtn').onclick = () => {
+    if (locked()) return;
+    if (!armTimer) {
+      const b = $('#doneBtn'); b.classList.add('armed'); b.textContent = 'Tap again to lock in';
+      armTimer = setTimeout(disarm, 3000);
+      return;
+    }
+    disarm();
+    submitDrawing();
+  };
+  // Enter just saves the guess; it never submits the drawing.
+  $('#guessInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); toast('Guess saved. Keep drawing!', 1500); }
+  });
 
-  function thumb(key, trace, extraCls = '') {
-    const t = el('div', 'thumb' + (trace ? ' trace' : '') + (extraCls ? ' ' + extraCls : ''));
-    if (trace) { const bg = document.createElement('canvas'); t.appendChild(bg); blurredInto(bg); }
+  function thumb(key, extraCls = '') {
+    const t = el('div', 'thumb' + (extraCls ? ' ' + extraCls : ''));
     const img = new Image(); img.alt = 'Drawing'; img.src = `/api/drawing/${state.code}/${key}`;
     t.appendChild(img);
     return t;
@@ -463,7 +722,7 @@
     if (voteKey !== sig) {
       voteKey = sig; gal.innerHTML = '';
       for (const g of state.gallery) {
-        const t = thumb(g.key, state.settings.trace, g.mine ? 'mine' : '');
+        const t = thumb(g.key, g.mine ? 'mine' : '');
         t.dataset.key = g.key;
         if (g.mine) t.appendChild(el('span', 'badge', 'Yours'));
         else t.onclick = () => act('vote', { key: g.key }).catch(() => { });
@@ -492,7 +751,7 @@
     for (const r of state.results.rows) {
       const card = el('div', 'res-card' + (r.bestDrawing ? ' winner' : ''));
       if (r.drawingKey) {
-        const t = thumb(r.drawingKey, state.settings.trace, 'static');
+        const t = thumb(r.drawingKey, 'static');
         if (r.bestDrawing) t.appendChild(el('span', 'badge', '🏆 Best drawing'));
         card.appendChild(t);
       } else card.appendChild(el('div', 'noimg', 'No drawing'));
@@ -538,10 +797,10 @@
   // ------------------------------------------------------------ timer
   function tick() {
     const t = $('#timer');
-    if (!state || !state.endsAt || !['drawing', 'voting'].includes(state.phase)) { t.textContent = ''; t.classList.remove('low'); return; }
+    if (!state || !state.endsAt || !['drawing', 'voting', 'choosing', 'sketch', 'turnEnd'].includes(state.phase)) { t.textContent = ''; t.classList.remove('low'); return; }
     const left = Math.max(0, Math.ceil((state.endsAt - (Date.now() + clockOffset)) / 1000));
     t.textContent = left + 's';
-    t.classList.toggle('low', left <= 10);
+    t.classList.toggle('low', left <= 10 && state.phase !== 'turnEnd');
     // Auto-submit once when time runs out.
     if (state.phase === 'drawing' && left <= 0 && autoRound !== state.round) { autoRound = state.round; submitDrawing(); }
   }

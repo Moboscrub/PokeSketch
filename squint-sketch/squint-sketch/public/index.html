@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Squint &amp; Sketch</title>
+<title>PokeSketch</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%E2%9C%8F%EF%B8%8F%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -16,7 +16,7 @@
   <!-- HOME -->
   <section id="home" class="screen">
     <div class="home-card">
-      <h1 class="logo"><span>Squint</span><em>&amp;</em><span>Sketch</span></h1>
+      <h1 class="logo"><span>Poke</span><span class="alt">Sketch</span></h1>
       <p class="tagline">Everyone gets the same blurry Pokémon card. Draw what you see, guess who it is, vote for the best drawing.</p>
       <label class="field">
         <span>Your name</span>
@@ -34,7 +34,7 @@
   <!-- LOBBY -->
   <section id="lobby" class="screen hidden">
     <div class="topbar">
-      <div class="logo small"><span>Squint</span><em>&amp;</em><span>Sketch</span></div>
+      <div class="logo small"><span>Poke</span><span class="alt">Sketch</span></div>
       <button class="btn ghost leaveBtn">Leave</button>
     </div>
     <div class="lobby-grid">
@@ -49,6 +49,14 @@
         <h3 class="panel-title">Game settings <span id="hostNote" class="muted"></span></h3>
 
         <div class="setting">
+          <div class="setting-head"><span>Game mode</span></div>
+          <div class="modes" id="modes">
+            <button class="mode" data-mode="blur"><b>🔍 Blurry Card</b><small>Everyone draws the same blurry card, guesses who it is, then votes on the best drawing.</small></button>
+            <button class="mode" data-mode="sketch"><b>✏️ Sketch &amp; Guess</b><small>Take turns drawing a Pokémon you pick from 3. Everyone else races to guess it.</small></button>
+          </div>
+        </div>
+
+        <div class="setting">
           <div class="setting-head">
             <span>Generations</span>
             <span class="mini-btns"><button class="link host-only" id="gensAll">All</button><button class="link host-only" id="gensKanto">Gen 1 only</button></span>
@@ -57,8 +65,8 @@
         </div>
 
         <div class="setting">
-          <div class="setting-head"><span>Rounds</span></div>
-          <div class="chips" data-setting="rounds" data-values="3,5,8,10"></div>
+          <div class="setting-head"><span>Rounds</span><small class="muted" id="roundsNote"></small></div>
+          <div class="chips" data-setting="rounds" data-values="1,2,3,5,8,10"></div>
         </div>
 
         <div class="setting">
@@ -66,17 +74,9 @@
           <div class="chips" data-setting="drawTime" data-values="45,60,90,120,180" data-suffix="s"></div>
         </div>
 
-        <div class="setting">
+        <div class="setting" id="blurSetting">
           <div class="setting-head"><span>Blur</span></div>
           <div class="chips" data-setting="blur" data-values="light,medium,heavy,brutal"></div>
-        </div>
-
-        <div class="setting">
-          <label class="toggle">
-            <input type="checkbox" id="traceToggle">
-            <span class="toggle-ui"></span>
-            <span><b>Trace mode</b><br><small class="muted">Draw right on top of the blurry card</small></span>
-          </label>
         </div>
 
         <button id="startBtn" class="btn big primary host-only">Start game</button>
@@ -114,13 +114,35 @@
           </div>
         </div>
 
+        <div id="v-choose" class="view hidden">
+          <div class="panel center choose-panel">
+            <div id="chooseMine">
+              <h2>Pick a Pokémon to draw</h2>
+              <div class="choices" id="choices"></div>
+              <p class="muted">If you don't pick, you get the first one.</p>
+            </div>
+            <div id="chooseWait">
+              <div class="ball small-ball"></div>
+              <h2 id="chooseWho">Someone is picking a Pokémon…</h2>
+              <p class="muted">Get ready to guess!</p>
+            </div>
+          </div>
+        </div>
+
         <div id="v-draw" class="view hidden">
           <div class="draw-layout">
             <div class="card-ref" id="cardRef"><canvas id="refCanvas"></canvas><div class="card-caption">Squint harder.</div></div>
+            <div class="word-panel" id="wordPanel">
+              <div class="wp-who" id="wpWho"></div>
+              <div class="wp-hint" id="wpHint"></div>
+              <div class="wp-sub muted" id="wpSub"></div>
+              <img id="wpCard" class="wp-card hidden" alt="Reference card">
+            </div>
             <div class="stage-wrap">
               <div class="stage" id="stage">
                 <canvas id="bgCanvas"></canvas>
                 <canvas id="drawCanvas"></canvas>
+                <div class="turn-overlay hidden" id="turnOverlay"></div>
                 <div class="locked hidden" id="lockedOverlay"><div>🔒 Locked in!<br><small>Waiting for everyone else…</small></div></div>
               </div>
               <div class="tools" id="tools">
@@ -136,8 +158,11 @@
                   <span class="sep"></span>
                   <button class="tool" id="undoBtn" title="Undo (Ctrl+Z)">↶</button>
                   <button class="tool" id="clearBtn" title="Clear">🗑️</button>
+                  <span class="sep trace-sep"></span>
+                  <button class="trace-btn" id="traceBtn" title="Show the blurry card behind your drawing (T)">👻 Trace</button>
                 </div>
               </div>
+              <button id="doneBtn" class="btn big primary done-btn">Lock it in</button>
             </div>
             <div class="guess-box">
               <label class="field">
@@ -145,8 +170,13 @@
                 <input id="guessInput" list="pokeNames" maxlength="40" placeholder="Your guess" autocomplete="off">
                 <datalist id="pokeNames"></datalist>
               </label>
-              <button id="doneBtn" class="btn big primary">Lock it in</button>
               <p class="muted small-print">+1 for naming it right · +1 for the most votes</p>
+            </div>
+            <div class="chat-panel" id="chatPanel">
+              <div class="chat-title">Guesses</div>
+              <div class="chat-log" id="chatLog"></div>
+              <input id="chatInput" list="pokeNames" maxlength="60" placeholder="Type your guess…" autocomplete="off">
+              <p class="muted small-print">Faster guesses score more. The drawer scores for every correct guess.</p>
             </div>
           </div>
         </div>
