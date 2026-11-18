@@ -266,7 +266,7 @@ async function startRound(room) {
   room.round += 1;
   if (room.round > room.settings.rounds) { room.phase = 'final'; room.endsAt = 0; broadcast(room); return; }
   room.phase = 'loading'; room.error = null; room.endsAt = 0;
-  room.submissions = new Map(); room.votes = new Map(); room.keys = new Map(); room.results = null; room.card = null;
+  room.submissions = new Map(); room.drafts = new Map(); room.votes = new Map(); room.keys = new Map(); room.results = null; room.card = null;
   broadcast(room);
   const token = ++room.loadingToken;
   try {
@@ -278,7 +278,7 @@ async function startRound(room) {
     room.phase = 'drawing';
     room.endsAt = Date.now() + room.settings.drawTime * 1000;
     // Small grace period so last-second uploads make it in.
-    room.timer = setTimeout(() => endDrawing(room), room.settings.drawTime * 1000 + 3500);
+    room.timer = setTimeout(() => endDrawing(room), room.settings.drawTime * 1000 + 6000);
     broadcast(room);
   } catch (e) {
     if (token !== room.loadingToken) return;
@@ -292,6 +292,10 @@ async function startRound(room) {
 function endDrawing(room) {
   if (room.phase !== 'drawing') return;
   clearTimer(room);
+  // Anyone who never locked in (phone locked, switched apps, slow upload) gets their last autosave.
+  for (const [pid, d] of room.drafts || []) {
+    if (!room.submissions.has(pid) && room.players.has(pid)) room.submissions.set(pid, { ...d, correct: isCorrect(d.guess, room.answers) });
+  }
   // Every drawn picture gets an anonymous key for voting.
   const entries = [...room.submissions.entries()].filter(([, s]) => s.drawing);
   for (let i = entries.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [entries[i], entries[j]] = [entries[j], entries[i]]; }
@@ -352,6 +356,20 @@ function finishRound(room) {
 const CHOOSE_SECONDS = 15;
 const TURN_END_SECONDS = 7;
 
+// Official artwork exists for every Pokémon, so the drawer always has a reference picture.
+const artworkUrl = dex => `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${dex}.png`;
+async function fetchReferenceCard(dex) {
+  if (MOCK) return mockCard(dex);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const cards = await fetchCardsForDex(dex);
+      if (!cards.length) return null; // some newer Pokémon have no cards yet
+      const x = cards[Math.floor(Math.random() * cards.length)];
+      return { name: x.name, set: x.set ? x.set.name : '', image: x.images.large || x.images.small };
+    } catch (_) { /* slow or failed: try once more */ }
+  }
+  return null;
+}
 function startSketchGame(room) {
   clearTimer(room);
   room.card = null; room.results = null; room.error = null;
@@ -410,6 +428,7 @@ async function prepareChoosing(room) {
   }
   sk.turnNo += 1;
   sk.choices = picks.map(n => ({ dex: n, name: species[n].display }));
+  sk.cardFetches = new Map(picks.map(n => [n, fetchReferenceCard(n).catch(() => null)]));
   sk.word = null; sk.revealed = new Set(); sk.guessed = new Map(); sk.ops = []; sk.result = null;
   room.card = null; room.error = null;
   room.phase = 'choosing';
@@ -437,21 +456,12 @@ function chooseWord(room, i) {
   const drawer = room.players.get(sk.drawerId);
   skChat(room, { sys: true, text: `${drawer ? drawer.name : 'Someone'} is drawing!` });
   broadcast(room);
-  // Fetch a real card for the drawer's reference and the reveal (doesn't block the turn).
+  // Use the card that started loading while the drawer was choosing.
   const turnNo = sk.turnNo;
-  (async () => {
-    try {
-      let card;
-      if (MOCK) card = mockCard(c.dex);
-      else {
-        const cards = await fetchCardsForDex(c.dex);
-        if (!cards.length) return;
-        const x = cards[Math.floor(Math.random() * cards.length)];
-        card = { name: x.name, set: x.set ? x.set.name : '', image: x.images.large || x.images.small };
-      }
-      if (room.sk === sk && sk.turnNo === turnNo) { room.card = card; broadcast(room); }
-    } catch (_) { /* reference card is optional */ }
-  })();
+  const pending = (sk.cardFetches && sk.cardFetches.get(c.dex)) || fetchReferenceCard(c.dex);
+  pending.then(card => {
+    if (card && room.sk === sk && sk.turnNo === turnNo) { room.card = card; broadcast(room); }
+  });
 }
 function revealHint(room) {
   const sk = room.sk;
@@ -581,11 +591,11 @@ function sketchState(room, pid) {
   if (room.phase === 'sketch' && sk.word) {
     out.sk.hint = hintPattern(sk);
     if (isDrawer || sk.guessed.has(pid)) out.sk.word = sk.word.display;
-    if (isDrawer && room.card) out.card = { image: room.card.image };
+    if (isDrawer) out.card = { art: MOCK ? null : artworkUrl(sk.word.dex), image: room.card ? room.card.image : null };
   }
   if (room.phase === 'turnEnd') {
     out.sk.result = sk.result;
-    if (room.card) out.card = { image: room.card.image, cardName: room.card.name, set: room.card.set };
+    out.card = { art: MOCK || !sk.word ? null : artworkUrl(sk.word.dex), image: room.card ? room.card.image : null };
   }
   return out;
 }
@@ -613,6 +623,11 @@ function auth(body) {
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json' };
 
 // ---------------------------------------------------------------- actions
+function readPng(body) {
+  if (body.blank || typeof body.drawing !== 'string' || !body.drawing.startsWith('data:image/png;base64,')) return null;
+  const buf = Buffer.from(body.drawing.slice(22), 'base64');
+  return buf.length < 4 * 1024 * 1024 && buf.slice(0, 4).toString('hex') === '89504e47' ? buf : null;
+}
 function handleAction(room, p, body) {
   const isHost = room.hostId === p.id;
   switch (body.type) {
@@ -670,14 +685,17 @@ function handleAction(room, p, body) {
       chooseWord(room, i); return null;
     }
     case 'guess': return sketchGuess(room, p, body);
+    case 'draft': { // silent autosave while drawing
+      if (room.phase !== 'drawing' || Number(body.round) !== room.round || room.submissions.has(p.id)) return null;
+      const drawing = readPng(body);
+      const guess = String(body.guess || '').slice(0, 40);
+      if (drawing || guess) room.drafts.set(p.id, { guess, drawing });
+      return null;
+    }
     case 'submit': {
       if (room.phase !== 'drawing' || Number(body.round) !== room.round) return 'Drawing time is over.';
       const guess = String(body.guess || '').slice(0, 40);
-      let drawing = null;
-      if (!body.blank && typeof body.drawing === 'string' && body.drawing.startsWith('data:image/png;base64,')) {
-        const buf = Buffer.from(body.drawing.slice(22), 'base64');
-        if (buf.length < 4 * 1024 * 1024 && buf.slice(0, 4).toString('hex') === '89504e47') drawing = buf;
-      }
+      const drawing = readPng(body);
       room.submissions.set(p.id, { guess, drawing, correct: isCorrect(guess, room.answers) });
       broadcast(room);
       const everyone = connectedPlayers(room);
