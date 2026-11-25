@@ -5,9 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>PokeSketch</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%E2%9C%8F%EF%B8%8F%3C/text%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<!-- The font comes through our own server so it also loads inside Discord. -->
+<link href="/ext/fonts.css" rel="stylesheet" media="print" onload="this.media='all'">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -31,6 +30,20 @@
     </div>
   </section>
 
+  <!-- DISCORD (shown while the Activity connects) -->
+  <section id="discordScreen" class="screen hidden">
+    <div class="home-card center">
+      <h1 class="logo"><span>Poke</span><span class="alt">Sketch</span></h1>
+      <div class="ball small-ball"></div>
+      <p id="discordStatus" class="tagline">Connecting to Discord…</p>
+      <div id="discordName" class="hidden">
+        <label class="field"><span>Your name</span><input id="discordNameInput" maxlength="16" placeholder="Trainer name" autocomplete="off"></label>
+        <button id="discordJoinBtn" class="btn big primary">Join game</button>
+      </div>
+      <button id="discordRetry" class="btn big hidden">Try again</button>
+    </div>
+  </section>
+
   <!-- LOBBY -->
   <section id="lobby" class="screen hidden">
     <div class="topbar">
@@ -39,6 +52,7 @@
     </div>
     <div class="lobby-grid">
       <div class="panel">
+        <p class="discord-only discord-note">🎮 Everyone who opens PokeSketch in this voice channel joins this lobby automatically.</p>
         <div class="room-code-label">Room code</div>
         <div id="roomCode" class="room-code">----</div>
         <button id="copyLinkBtn" class="btn">Copy invite link</button>
