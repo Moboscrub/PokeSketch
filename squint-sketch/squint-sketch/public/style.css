@@ -292,3 +292,11 @@ body.mode-sketch #traceBtn, body.mode-sketch .trace-sep, body.mode-sketch #bgCan
 .turn-overlay .to-rows { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 4px; min-width: 200px; }
 .turn-overlay .to-rows li { display: flex; justify-content: space-between; gap: 12px; font-weight: 600; }
 .turn-overlay .to-rows .miss { color: var(--muted); font-weight: 400; }
+
+/* ---------- inside Discord ---------- */
+body:not(.in-discord) .discord-only { display: none !important; }
+body.in-discord .room-code-label, body.in-discord .room-code, body.in-discord #copyLinkBtn, body.in-discord .leaveBtn { display: none !important; }
+.discord-note { background: #eef0ff; color: #3c45a5; border-radius: 12px; padding: 10px 12px; margin: 0 0 6px; font-weight: 600; text-align: center; }
+#discordScreen { display: grid; place-items: center; padding: 24px 16px; }
+#discordScreen.hidden { display: none; }
+#discordScreen .small-ball { margin: 14px auto 4px; }
