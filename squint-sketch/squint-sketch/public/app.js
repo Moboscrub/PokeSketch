@@ -23,7 +23,6 @@
   };
   let session = null;   // {code,pid,token}
   let state = null;
-  let es = null;
   let clockOffset = 0;
   let unloading = false;
   addEventListener('pagehide', () => { unloading = true; });
@@ -45,6 +44,75 @@
     try { return await api('/api/action', { ...session, type, ...extra }); }
     catch (e) { toast(e.message); throw e; }
   }
+
+  // ------------------------------------------------------------ Discord Activity
+  // Discord opens the page with ?frame_id=…&instance_id=… in the URL. Everyone who opens
+  // the Activity in the same voice channel shares an instance id, so they share a room.
+  const IN_DISCORD = params0().has('frame_id') && params0().has('instance_id');
+  function params0() { return new URLSearchParams(location.search); }
+  if (IN_DISCORD) document.body.classList.add('in-discord');
+  // Inside Discord, outside images must come through our own server.
+  const viaProxy = u => (IN_DISCORD && /^https:\/\//.test(u || '')) ? '/ext/img?u=' + encodeURIComponent(u) : u;
+  const discord = { sdk: null, instanceId: null, access_token: null };
+
+  function discordStatus(text, showRetry = false) {
+    $('#discordStatus').textContent = text;
+    $('#discordRetry').classList.toggle('hidden', !showRetry);
+  }
+  function withTimeout(promise, ms, what) {
+    return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(what + ' timed out')), ms))]);
+  }
+  async function discordBoot() {
+    showScreen('discordScreen');
+    $('#discordName').classList.add('hidden');
+    discordStatus('Connecting to Discord…');
+    try {
+      const cfg = await (await fetch('/api/discord/config')).json();
+      if (!cfg.clientId) { discordStatus('The server is missing DISCORD_CLIENT_ID. Add it in Render → Environment, then relaunch.', true); return; }
+      if (!discord.sdk) {
+        const { DiscordSDK } = await withTimeout(import(cfg.sdk), 20000, 'Loading Discord SDK');
+        discord.sdk = new DiscordSDK(cfg.clientId);
+        await withTimeout(discord.sdk.ready(), 20000, 'Discord handshake');
+        discord.instanceId = discord.sdk.instanceId;
+      }
+      if (!discord.access_token) {
+        discordStatus('Signing in with Discord…');
+        try {
+          const { code } = await discord.sdk.commands.authorize({ client_id: cfg.clientId, response_type: 'code', state: '', prompt: 'none', scope: ['identify'] });
+          const t = await api('/api/discord/token', { code });
+          discord.access_token = t.access_token;
+          try { await discord.sdk.commands.authenticate({ access_token: t.access_token }); } catch (_) { }
+        } catch (e) {
+          // Declined or not set up: fall back to typing a name.
+          discord.access_token = null;
+          discordStatus('Pick a name to join the game.');
+          $('#discordName').classList.remove('hidden');
+          $('#discordNameInput').value = store.name();
+          return;
+        }
+      }
+      await discordJoinNow();
+    } catch (e) {
+      discordStatus("Couldn't connect: " + e.message, true);
+    }
+  }
+  async function discordJoinNow(name) {
+    showScreen('discordScreen');
+    discordStatus('Joining the game…');
+    try {
+      const saved = store.get() || {};
+      const r = await api('/api/discord/join', { instanceId: discord.instanceId, access_token: discord.access_token, name: name || store.name() || 'Trainer', pid: saved.pid, token: saved.token });
+      connect(r);
+    } catch (e) { discordStatus(e.message, true); }
+  }
+  $('#discordRetry').onclick = () => { discord.access_token = discord.access_token || null; discordBoot(); };
+  $('#discordJoinBtn').onclick = () => {
+    const n = $('#discordNameInput').value.trim();
+    if (!n) { toast('Pick a name first!'); return; }
+    store.setName(n);
+    $('#discordName').classList.add('hidden');
+    discordJoinNow(n);
+  };
 
   // ------------------------------------------------------------ home
   const params = new URLSearchParams(location.search);
@@ -70,33 +138,83 @@
   $('#codeInput').addEventListener('keydown', e => { if (e.key === 'Enter') join(); });
   $('#codeInput').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, ''); });
 
-  function connect(r) {
-    session = { code: r.code, pid: r.pid, token: r.token };
-    store.set(session);
-    history.replaceState(null, '', '?room=' + r.code);
-    if (es) es.close();
-    es = new EventSource(`/api/events?code=${encodeURIComponent(session.code)}&pid=${encodeURIComponent(session.pid)}&token=${encodeURIComponent(session.token)}`);
-    es.onmessage = ev => {
-      const data = JSON.parse(ev.data);
-      if (data.kicked) { leaveLocal('You were removed from the room.'); return; }
-      clockOffset = data.serverNow - Date.now();
-      state = data;
-      render();
+  // ------------------------------------------------------------ live connection
+  // WebSocket first (it's what Discord's proxy supports); Server-Sent Events as a fallback.
+  let stream = null;
+  let wsFailures = 0;
+  const qs = () => `code=${encodeURIComponent(session.code)}&pid=${encodeURIComponent(session.pid)}&token=${encodeURIComponent(session.token)}`;
+  function onState(data) {
+    if (data.kicked) { leaveLocal('You were removed from the room.'); return; }
+    clockOffset = data.serverNow - Date.now();
+    state = data;
+    render();
+  }
+  function closeStream() {
+    const s = stream; stream = null;
+    if (!s) return;
+    try { s.kind === 'ws' ? s.ws.close() : s.es.close(); } catch (_) { }
+  }
+  function openStream() {
+    closeStream();
+    if (!session) return;
+    if (wsFailures >= 2 || typeof WebSocket === 'undefined') return openSSE();
+    let ws;
+    try { ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws?${qs()}`); }
+    catch (_) { wsFailures = 2; return openSSE(); }
+    const me = { kind: 'ws', ws, opened: false };
+    stream = me;
+    ws.onopen = () => { me.opened = true; wsFailures = 0; };
+    ws.onmessage = ev => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.t === 'state') onState(m.d); else if (m.t === 'ops') onOps(m.d);
+      } catch (_) { }
     };
+    ws.onclose = () => {
+      if (stream !== me || unloading) return;
+      if (!me.opened) wsFailures++;
+      stream = null;
+      setTimeout(reconnect, me.opened ? 800 : 1500);
+    };
+  }
+  function openSSE() {
+    const es = new EventSource(`/api/events?${qs()}`);
+    const me = { kind: 'sse', es };
+    stream = me;
+    es.onmessage = ev => { try { onState(JSON.parse(ev.data)); } catch (_) { } };
     es.addEventListener('ops', ev => { try { onOps(JSON.parse(ev.data)); } catch (_) { } });
-    const mine = es;
     es.onerror = () => {
       // The browser also closes the stream while the page unloads; don't forget the session then.
       setTimeout(() => {
-        if (!unloading && es === mine && mine.readyState === EventSource.CLOSED) leaveLocal('Lost the room (it may have closed).');
+        if (!unloading && stream === me && es.readyState === EventSource.CLOSED) { stream = null; reconnect(); }
       }, 300);
     };
   }
+  // The connection dropped: check we still have a seat, then reopen it.
+  async function reconnect() {
+    if (!session || unloading || stream) return;
+    try {
+      const r = await api('/api/join', { ...session, name: store.name() || 'Trainer' });
+      if (r.pid !== session.pid) throw new Error('seat lost');
+      openStream();
+    } catch (_) {
+      if (IN_DISCORD) { session = null; state = null; discordJoinNow(); }
+      else leaveLocal('Lost the room (it may have closed).');
+    }
+  }
+  function connect(r) {
+    session = { code: r.code, pid: r.pid, token: r.token };
+    store.set(session);
+    if (!IN_DISCORD) history.replaceState(null, '', '?room=' + r.code);
+    openStream();
+  }
   function leaveLocal(msg) {
-    if (es) es.close(); es = null; session = null; state = null; store.clear();
-    history.replaceState(null, '', location.pathname);
+    closeStream(); session = null; state = null; store.clear();
+    if (!IN_DISCORD) history.replaceState(null, '', location.pathname);
     drawRoundKey = null;
-    showScreen('home'); if (msg) toast(msg);
+    if (IN_DISCORD) { showScreen('discordScreen'); discordStatus('You left the game.', true); }
+    else showScreen('home');
+    if (msg) toast(msg);
   }
   $$('.leaveBtn').forEach(b => b.onclick = async () => {
     try { await act('leave'); } catch (_) { }
@@ -105,6 +223,7 @@
 
   // Try to resume a saved session (e.g. after a refresh).
   (async () => {
+    if (IN_DISCORD) return discordBoot();
     const saved = store.get();
     const want = params.get('room');
     if (saved && (!want || want.toUpperCase() === saved.code)) {
@@ -113,12 +232,12 @@
   })();
 
   // ------------------------------------------------------------ render
-  function showScreen(id) { ['home', 'lobby', 'game'].forEach(s => $('#' + s).classList.toggle('hidden', s !== id)); }
+  function showScreen(id) { ['home', 'lobby', 'game', 'discordScreen'].forEach(s => $('#' + s).classList.toggle('hidden', s !== id)); }
   const me = () => state && state.players.find(p => p.id === state.you);
   const isHost = () => state && state.hostId === state.you;
 
   function render() {
-    if (!state) { showScreen('home'); return; }
+    if (!state) { showScreen(IN_DISCORD ? 'discordScreen' : 'home'); return; }
     document.body.classList.toggle('is-host', isHost());
     if (state.phase === 'lobby') { showScreen('lobby'); renderLobby(); return; }
     showScreen('game');
@@ -252,7 +371,7 @@
   }
   async function blurredInto(canvas) {
     if (!state.card) return;
-    try { const img = await loadImage(state.card.image); drawBlurredCard(canvas, img, state.settings.blur); }
+    try { const img = await loadImage(viaProxy(state.card.image)); drawBlurredCard(canvas, img, state.settings.blur); }
     catch (e) { toast(e.message); }
   }
 
@@ -517,6 +636,7 @@
 
   function setRef(img, src) {
     if (!src) { img.classList.add('hidden'); img.removeAttribute('src'); return; }
+    src = viaProxy(src);
     if (img.getAttribute('src') !== src) {
       img.onerror = () => img.classList.add('hidden');
       img.src = src;
@@ -774,7 +894,7 @@
     $('#nextBtn').textContent = state.results && state.results.isLast ? 'See final scores' : 'Next round';
     if (resultsKey === sig) return;
     resultsKey = sig;
-    $('#revealImg').src = state.card.image;
+    $('#revealImg').src = viaProxy(state.card.image);
     $('#revealName').textContent = state.card.name;
     $('#revealCard').textContent = [state.card.cardName, state.card.set].filter(Boolean).join(' · ');
     const gal = $('#resultsGallery'); gal.innerHTML = '';
