@@ -2,6 +2,7 @@
 // Zero dependencies. Requires Node 18+ (uses built-in fetch).
 // Run:  node server.js        (then open http://localhost:3000)
 // Env:  PORT=3000  POKEMONTCG_API_KEY=xxxx (optional, raises rate limits)  MOCK=1 (offline test cards)
+//       DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET (only for running as a Discord Activity)
 
 const http = require('http');
 const fs = require('fs');
@@ -247,12 +248,38 @@ function publicState(room, pid) {
   if (room.sk && ['choosing', 'sketch', 'turnEnd', 'final', 'error'].includes(room.phase)) Object.assign(s, sketchState(room, pid));
   return s;
 }
-function send(res, obj) { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) { } }
+// A subscriber is one open live connection (Server-Sent Events or WebSocket).
+// sub.state(obj) pushes game state; sub.ops(obj) pushes live drawing strokes.
+function sseSub(res) {
+  return {
+    state: obj => { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) { } },
+    opsRaw: text => { try { res.write(`event: ops\ndata: ${text}\n\n`); } catch (_) { } },
+    end: () => { try { res.end(); } catch (_) { } },
+  };
+}
+function wsSub(ws) {
+  return {
+    state: obj => ws.sendText(`{"t":"state","d":${JSON.stringify(obj)}}`),
+    opsRaw: text => ws.sendText(`{"t":"ops","d":${text}}`),
+    end: () => ws.close(),
+  };
+}
+function addSub(room, pl, sub) {
+  if (!room.subs.has(pl.id)) room.subs.set(pl.id, new Set());
+  room.subs.get(pl.id).add(sub);
+  pl.connected = true; pl.lastSeen = Date.now();
+  if (!room.players.has(room.hostId)) room.hostId = pl.id;
+  broadcast(room);
+}
+function removeSub(room, pl, sub) {
+  const set = room.subs.get(pl.id);
+  if (set) { set.delete(sub); if (!set.size) { room.subs.delete(pl.id); if (room.players.has(pl.id)) onDisconnect(room, pl); } }
+}
 function broadcast(room) {
   room.lastActive = Date.now();
   for (const [pid, set] of room.subs) {
     const st = publicState(room, pid);
-    for (const res of set) send(res, st);
+    for (const sub of set) sub.state(st);
   }
 }
 function clearTimer(room) {
@@ -541,10 +568,10 @@ function sketchDraw(room, p, body) {
   const ops = body.ops.map(cleanOp).filter(Boolean);
   if (!ops.length) return null;
   sk.ops.push(...ops);
-  const payload = `event: ops\ndata: ${JSON.stringify({ turnNo: sk.turnNo, from, ops })}\n\n`;
+  const payload = JSON.stringify({ turnNo: sk.turnNo, from, ops });
   for (const [pid, set] of room.subs) {
     if (pid === p.id) continue;
-    for (const res of set) { try { res.write(payload); } catch (_) { } }
+    for (const sub of set) sub.opsRaw(payload);
   }
   room.lastActive = Date.now();
   return null;
@@ -718,13 +745,13 @@ function handleAction(room, p, body) {
       if (!t) return null;
       room.players.delete(t.id);
       const subs = room.subs.get(t.id);
-      if (subs) { for (const r of subs) { send(r, { kicked: true }); try { r.end(); } catch (_) { } } room.subs.delete(t.id); }
+      if (subs) { for (const r of subs) { r.state({ kicked: true }); r.end(); } room.subs.delete(t.id); }
       broadcast(room); return null;
     }
     case 'leave': {
       room.players.delete(p.id);
       if (room.hostId === p.id) { const next = connectedPlayers(room)[0] || [...room.players.values()][0]; room.hostId = next ? next.id : null; }
-      if (!room.players.size) { clearTimer(room); rooms.delete(room.code); return null; }
+      if (!room.players.size) { clearTimer(room); rooms.delete(room.code); if (room.instanceId) instanceRooms.delete(room.instanceId); return null; }
       if (room.sk && ['choosing', 'sketch'].includes(room.phase)) {
         if (room.sk.drawerId === p.id) { endTurn(room); return null; }
         maybeAllGuessed(room);
@@ -758,6 +785,160 @@ function onDisconnect(room, p) {
   }, 15000);
 }
 
+
+// ---------------------------------------------------------------- Discord Activity support
+// Inside Discord the game runs in a sandboxed iframe that can only talk to this server
+// (through Discord's proxy). So this server: swaps the sign-in code for a token, puts
+// everyone in the same voice-channel session into one room, and relays the few outside
+// files the page needs (Discord's SDK, card images, artwork, the font).
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '';
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || '';
+const DISCORD_SDK_PATH = '/npm/@discord/embedded-app-sdk@2.5.0/+esm';
+const instanceRooms = new Map(); // Discord activity instance id -> room code
+
+async function discordUser(accessToken) {
+  if (!accessToken) return null;
+  if (MOCK && accessToken.startsWith('tok-')) { const n = accessToken.slice(4); return { id: 'u-' + n, name: n }; }
+  try {
+    const r = await fetch('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const u = await r.json();
+    return u && u.id ? { id: String(u.id), name: u.global_name || u.username } : null;
+  } catch (_) { return null; }
+}
+async function discordJoin(body) {
+  const instanceId = String(body.instanceId || '').slice(0, 120);
+  if (!/^[\w.:-]+$/.test(instanceId)) return [400, { error: 'Missing Discord activity instance.' }];
+  const user = await discordUser(body.access_token);
+  let room = rooms.get(instanceRooms.get(instanceId));
+  if (!room) {
+    room = createRoom();
+    room.instanceId = instanceId;
+    instanceRooms.set(instanceId, room.code);
+  }
+  // Same Discord account coming back (reload, second device): give them their seat back.
+  if (user) {
+    for (const pl of room.players.values()) if (pl.discordId === user.id) return [200, { code: room.code, pid: pl.id, token: pl.token, discord: true }];
+  }
+  const existing = room.players.get(body.pid);
+  if (existing && existing.token === body.token) return [200, { code: room.code, pid: existing.id, token: existing.token, discord: true }];
+  if (room.players.size >= 16) return [400, { error: 'This game is full (16 players).' }];
+  const pl = addPlayer(room, cleanName(user ? user.name : body.name));
+  if (user) pl.discordId = user.id;
+  broadcast(room);
+  return [200, { code: room.code, pid: pl.id, token: pl.token, discord: true }];
+}
+
+// Small in-memory cache for relayed files.
+const relayCache = new Map();
+async function relayFetch(url, headers = {}) {
+  const hit = relayCache.get(url);
+  if (hit && hit.until > Date.now()) return hit;
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error('upstream ' + r.status);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const out = { type: r.headers.get('content-type') || 'application/octet-stream', buf, until: Date.now() + 6 * 3600 * 1000 };
+  if (buf.length < 2 * 1024 * 1024) {
+    relayCache.set(url, out);
+    if (relayCache.size > 400) relayCache.delete(relayCache.keys().next().value);
+  }
+  return out;
+}
+function sendRelay(res, f, maxAge = 86400) {
+  res.writeHead(200, { 'Content-Type': f.type, 'Cache-Control': `public, max-age=${maxAge}` });
+  res.end(f.buf);
+}
+async function relaySdk(p, res) {
+  // Only Discord's SDK (a single self-contained file), nothing else from the CDN.
+  if (!/^\/npm\/@discord\/embedded-app-sdk@[\w.\-]+\/\+esm$/.test(p)) { res.writeHead(404); return res.end(); }
+  try { sendRelay(res, await relayFetch('https://cdn.jsdelivr.net' + p)); }
+  catch (e) { res.writeHead(502); res.end(); }
+}
+const IMAGE_HOSTS = [/^https:\/\/images\.pokemontcg\.io\//, /^https:\/\/raw\.githubusercontent\.com\/PokeAPI\/sprites\//];
+async function relayImage(u, res) {
+  if (!u || !IMAGE_HOSTS.some(rx => rx.test(u))) { res.writeHead(404); return res.end(); }
+  try {
+    const f = await relayFetch(u);
+    if (!/^image\//.test(f.type)) { res.writeHead(404); return res.end(); }
+    sendRelay(res, f, 7 * 86400);
+  } catch (_) { res.writeHead(502); res.end(); }
+}
+const FONT_CSS = 'https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap';
+async function relayFontCss(res) {
+  try {
+    const f = await relayFetch(FONT_CSS, { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36' });
+    const css = f.buf.toString('utf8').replace(/https:\/\/fonts\.gstatic\.com\//g, '/ext/gstatic/');
+    res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
+    res.end(css);
+  } catch (_) { res.writeHead(200, { 'Content-Type': 'text/css' }); res.end('/* font unavailable */'); }
+}
+async function relayFontFile(rest, res) {
+  if (!/^[\w\-./]+\.(woff2|woff|ttf)$/.test(rest) || rest.includes('..')) { res.writeHead(404); return res.end(); }
+  try { sendRelay(res, await relayFetch('https://fonts.gstatic.com/' + rest), 30 * 86400); }
+  catch (_) { res.writeHead(502); res.end(); }
+}
+
+// ---------------------------------------------------------------- WebSocket (no packages needed)
+// Discord's proxy supports WebSockets for live updates, so the game uses them everywhere,
+// with Server-Sent Events kept as a fallback. Server -> client messages only;
+// players still send their actions with normal POST requests.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+function wsFrame(opcode, payload) {
+  const len = payload.length;
+  let head;
+  if (len < 126) { head = Buffer.alloc(2); head[1] = len; }
+  else if (len < 65536) { head = Buffer.alloc(4); head[1] = 126; head.writeUInt16BE(len, 2); }
+  else { head = Buffer.alloc(10); head[1] = 127; head.writeBigUInt64BE(BigInt(len), 2); }
+  head[0] = 0x80 | opcode;
+  return Buffer.concat([head, payload]);
+}
+function acceptWebSocket(req, socket) {
+  const key = req.headers['sec-websocket-key'];
+  if (!key || String(req.headers.upgrade || '').toLowerCase() !== 'websocket') { socket.destroy(); return null; }
+  const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  socket.setNoDelay(true);
+  let open = true, buf = Buffer.alloc(0);
+  const listeners = [];
+  const ws = {
+    sendText(text) { if (open) { try { socket.write(wsFrame(0x1, Buffer.from(text))); } catch (_) { } } },
+    close() { if (!open) return; try { socket.write(wsFrame(0x8, Buffer.alloc(0))); } catch (_) { } finish(); },
+    onClose(fn) { listeners.push(fn); },
+  };
+  function finish() {
+    if (!open) return; open = false;
+    clearInterval(ping);
+    try { socket.end(); } catch (_) { }
+    setTimeout(() => { try { socket.destroy(); } catch (_) { } }, 1000);
+    for (const fn of listeners) fn();
+  }
+  socket.on('data', chunk => {
+    buf = Buffer.concat([buf, chunk]);
+    if (buf.length > 1024 * 1024) return finish(); // clients have nothing big to say
+    while (buf.length >= 2) {
+      const opcode = buf[0] & 0x0f, masked = buf[1] & 0x80;
+      let len = buf[1] & 0x7f, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      const maskOff = off; if (masked) off += 4;
+      if (buf.length < off + len) return;
+      const data = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < data.length; i++) data[i] ^= buf[maskOff + (i % 4)];
+      buf = buf.subarray(off + len);
+      if (opcode === 0x8) { try { socket.write(wsFrame(0x8, Buffer.alloc(0))); } catch (_) { } return finish(); }
+      if (opcode === 0x9) { try { socket.write(wsFrame(0xA, data)); } catch (_) { } }
+      // text/binary/pong frames from the client are ignored
+    }
+  });
+  socket.on('close', finish);
+  socket.on('error', finish);
+  socket.on('end', finish);
+  // Keep proxies (Discord, Render) from closing an idle connection.
+  const ping = setInterval(() => { if (open) { try { socket.write(wsFrame(0x9, Buffer.alloc(0))); } catch (_) { } } }, 25000);
+  return ws;
+}
+
 // ---------------------------------------------------------------- server
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -786,17 +967,10 @@ const server = http.createServer(async (req, res) => {
       if (!pl) return json(res, 403, { error: 'Not in this room.' });
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       res.write('retry: 2000\n\n');
-      if (!room.subs.has(pl.id)) room.subs.set(pl.id, new Set());
-      room.subs.get(pl.id).add(res);
-      pl.connected = true; pl.lastSeen = Date.now();
-      if (!room.players.has(room.hostId)) room.hostId = pl.id;
-      broadcast(room);
+      const sub = sseSub(res);
+      addSub(room, pl, sub);
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) { } }, 20000);
-      req.on('close', () => {
-        clearInterval(ping);
-        const set = room.subs.get(pl.id);
-        if (set) { set.delete(res); if (!set.size) { room.subs.delete(pl.id); if (room.players.has(pl.id)) onDisconnect(room, pl); } }
-      });
+      req.on('close', () => { clearInterval(ping); removeSub(room, pl, sub); });
       return;
     }
     if (req.method === 'POST' && p === '/api/action') {
@@ -819,6 +993,35 @@ const server = http.createServer(async (req, res) => {
       if (!pl || !room.sk) return json(res, 403, { error: 'Not in this room.' });
       return json(res, 200, { turnNo: room.sk.turnNo, seq: room.sk.ops.length, ops: room.sk.ops });
     }
+    if (req.method === 'GET' && p === '/api/discord/config') {
+      if (MOCK && process.env.TEST_SDK_FILE) return json(res, 200, { clientId: 'test-client', sdk: '/__test_sdk.mjs' });
+      return json(res, 200, { clientId: DISCORD_CLIENT_ID || null, sdk: DISCORD_SDK_PATH });
+    }
+    if (MOCK && process.env.TEST_SDK_FILE && p === '/__test_sdk.mjs') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript' });
+      return res.end(fs.readFileSync(process.env.TEST_SDK_FILE));
+    }
+    if (req.method === 'POST' && p === '/api/discord/token') {
+      const body = await readBody(req, 10000);
+      if (MOCK && String(body.code || '').startsWith('mock-')) return json(res, 200, { access_token: 'tok-' + String(body.code).slice(5) });
+      if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) return json(res, 500, { error: 'Server is missing DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET.' });
+      const r = await fetch('https://discord.com/api/oauth2/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: DISCORD_CLIENT_ID, client_secret: DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code: String(body.code || '') }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.access_token) return json(res, 400, { error: 'Discord sign-in failed.' });
+      return json(res, 200, { access_token: j.access_token });
+    }
+    if (req.method === 'POST' && p === '/api/discord/join') {
+      const body = await readBody(req, 10000);
+      return json(res, ...(await discordJoin(body)));
+    }
+    if (req.method === 'GET' && p.startsWith('/npm/')) return relaySdk(p, res);
+    if (req.method === 'GET' && p === '/ext/img') return relayImage(url.searchParams.get('u'), res);
+    if (req.method === 'GET' && p === '/ext/fonts.css') return relayFontCss(res);
+    if (req.method === 'GET' && p.startsWith('/ext/gstatic/')) return relayFontFile(p.slice('/ext/gstatic/'.length), res);
     let m;
     if (req.method === 'GET' && (m = p.match(/^\/api\/drawing\/([A-Z]{4})\/([\w-]+)$/))) {
       const room = rooms.get(m[1]);
@@ -854,10 +1057,22 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/api/ws') { socket.destroy(); return; }
+  const { room, p: pl } = auth(Object.fromEntries(url.searchParams));
+  if (!pl) { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+  const ws = acceptWebSocket(req, socket);
+  if (!ws) return;
+  const sub = wsSub(ws);
+  ws.onClose(() => removeSub(room, pl, sub));
+  addSub(room, pl, sub);
+});
+
 // Drop rooms nobody has touched for 3 hours.
 setInterval(() => {
   const cutoff = Date.now() - 3 * 3600 * 1000;
-  for (const [code, room] of rooms) if (room.lastActive < cutoff && !room.subs.size) { clearTimer(room); rooms.delete(code); }
+  for (const [code, room] of rooms) if (room.lastActive < cutoff && !room.subs.size) { clearTimer(room); rooms.delete(code); if (room.instanceId) instanceRooms.delete(room.instanceId); }
 }, 10 * 60 * 1000);
 
 loadSpecies();
